@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "enterprise-architect": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "github:DITEC-Mracka/enterprise-architect-mcp"],
+      "env": {
+        "EA_QEA_PATH": "<path-to-your-qea-file-or-directory>"
+      }
+    }
+  }
+}
