@@ -25,6 +25,17 @@ export function configurePackageTools(server: McpServer, db: Database): void {
         const effectiveDepth = Math.min(depth, 3);
         const parentId = packageId ?? 0;
 
+        // Verify package exists when a specific ID is requested
+        if (packageId != null && packageId !== 0) {
+          const pkgExists = db.prepare("SELECT Package_ID FROM t_package WHERE Package_ID = ?").get(packageId);
+          if (!pkgExists) {
+            return {
+              content: [{ type: "text", text: JSON.stringify({ error: "not_found", message: `Package with ID ${packageId} not found`, packageId }, null, 2) }],
+              isError: true,
+            };
+          }
+        }
+
         let totalCount = 0;
 
         function getChildren(pid: number, currentDepth: number): PackageNode[] {
@@ -68,10 +79,17 @@ export function configurePackageTools(server: McpServer, db: Database): void {
 
         const tree = getChildren(parentId, effectiveDepth);
 
-        const response: any = { packages: tree };
-        if (totalCount >= MAX_PACKAGES) {
-          response.truncated = true;
+        const truncated = totalCount >= MAX_PACKAGES;
+        const response: any = {
+          packages: tree,
+          totalMatched: totalCount,
+          returned: tree.length,
+          truncated,
+          _meta: { sourceTables: ["t_package", "t_object"] },
+        };
+        if (truncated) {
           response.message = `Results truncated at ${MAX_PACKAGES} packages. Use a specific packageId to drill deeper.`;
+          response.continuation = { tool: "ea_get_package_tree", arguments: { packageId: parentId, depth: effectiveDepth } };
         }
 
         return {

@@ -7,6 +7,8 @@ import { configureConnectorTools } from "./tools/connectors.js";
 import { configurePackageTools } from "./tools/packages.js";
 import { configureDiagramTools } from "./tools/diagrams.js";
 import { configureScenarioTools } from "./tools/scenarios.js";
+import { configureSchemaTools } from "./tools/schema.js";
+import { configureResolveTools } from "./tools/resolve.js";
 
 export function configureAllTools(server: McpServer, db: Database): void {
   configureSearchTools(server, db);
@@ -15,4 +17,6 @@ export function configureAllTools(server: McpServer, db: Database): void {
   configurePackageTools(server, db);
   configureDiagramTools(server, db);
   configureScenarioTools(server, db);
+  configureSchemaTools(server, db);
+  configureResolveTools(server, db);
 }

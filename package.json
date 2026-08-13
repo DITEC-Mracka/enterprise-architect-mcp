@@ -1,6 +1,6 @@
 {
   "name": "enterprise-architect-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "MCP server for read-only access to Sparx Enterprise Architect .qea exports",
   "type": "module",
   "bin": {
@@ -10,11 +10,13 @@
     "dist"
   ],
   "scripts": {
-    "prebuild": "node -p \"'export const packageVersion = ' + JSON.stringify(require('./package.json').version) + ';\\n'\" > src/version.ts",
+    "prebuild": "node -e \"const v=require('./package.json').version;const ts=new Date().toISOString().replace(/[-:T]/g,'').slice(0,14);require('fs').writeFileSync('src/version.ts','export const packageVersion = '+JSON.stringify(v+'+'+ts)+';\\n')\"",
     "build": "tsc",
     "precommit": "npm run build",
     "watch": "tsc --watch",
-    "test": "jest"
+    "test": "jest",
+    "eval:generate": "npx tsx eval/generate-tasks.ts",
+    "eval:run": "npx tsx eval/runner.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

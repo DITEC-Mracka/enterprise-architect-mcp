@@ -2,13 +2,62 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Database } from "../database.js";
 import type { SQLInputValue } from "node:sqlite";
 import { z } from "zod";
+import { decodeEntities, foldText } from "../text.js";
+
+interface CorpusEntry {
+  sourceTable: string;
+  sourceId: number;
+  sourceField: string;
+  objectId: number;
+  foldedText: string;
+}
+
+const corpora = new WeakMap<Database, CorpusEntry[]>();
+
+function buildCorpus(db: Database): CorpusEntry[] {
+  const cached = corpora.get(db);
+  if (cached) return cached;
+
+  const entries: CorpusEntry[] = [];
+
+  // t_object: Name, Alias, Note
+  const objects = db.prepare("SELECT Object_ID, Name, Alias, Note FROM t_object").all() as any[];
+  for (const o of objects) {
+    if (o.Name) entries.push({ sourceTable: "t_object", sourceId: o.Object_ID, sourceField: "Name", objectId: o.Object_ID, foldedText: foldText(decodeEntities(o.Name)!) });
+    if (o.Alias) entries.push({ sourceTable: "t_object", sourceId: o.Object_ID, sourceField: "Alias", objectId: o.Object_ID, foldedText: foldText(decodeEntities(o.Alias)!) });
+    if (o.Note) entries.push({ sourceTable: "t_object", sourceId: o.Object_ID, sourceField: "Note", objectId: o.Object_ID, foldedText: foldText(decodeEntities(o.Note)!) });
+  }
+
+  // t_attribute: Name, Notes
+  const attrs = db.prepare("SELECT ID, Object_ID, Name, Notes FROM t_attribute").all() as any[];
+  for (const a of attrs) {
+    if (a.Name) entries.push({ sourceTable: "t_attribute", sourceId: a.ID, sourceField: "Name", objectId: a.Object_ID, foldedText: foldText(decodeEntities(a.Name)!) });
+    if (a.Notes) entries.push({ sourceTable: "t_attribute", sourceId: a.ID, sourceField: "Notes", objectId: a.Object_ID, foldedText: foldText(decodeEntities(a.Notes)!) });
+  }
+
+  // t_operation: Name, Notes
+  const ops = db.prepare("SELECT OperationID, Object_ID, Name, Notes FROM t_operation").all() as any[];
+  for (const op of ops) {
+    if (op.Name) entries.push({ sourceTable: "t_operation", sourceId: op.OperationID, sourceField: "Name", objectId: op.Object_ID, foldedText: foldText(decodeEntities(op.Name)!) });
+    if (op.Notes) entries.push({ sourceTable: "t_operation", sourceId: op.OperationID, sourceField: "Notes", objectId: op.Object_ID, foldedText: foldText(decodeEntities(op.Notes)!) });
+  }
+
+  // t_objectconstraint: Notes
+  const constraints = db.prepare(`SELECT Object_ID, Notes FROM t_objectconstraint WHERE Notes IS NOT NULL AND Notes != ''`).all() as any[];
+  for (const c of constraints) {
+    entries.push({ sourceTable: "t_objectconstraint", sourceId: c.Object_ID, sourceField: "Notes", objectId: c.Object_ID, foldedText: foldText(decodeEntities(c.Notes)!) });
+  }
+
+  corpora.set(db, entries);
+  return entries;
+}
 
 export function configureSearchTools(server: McpServer, db: Database): void {
   server.tool(
     "ea_search",
-    "Search Enterprise Architect model elements by name, alias, or notes content. Returns matching objects with their type, stereotype, package, and a note preview.",
+    "Search Enterprise Architect model elements by name, alias, notes, attribute names/notes, operation names/notes, or constraint notes. Matches across the full Slovak alphabet including encoded entities. Returns matching elements with a decoded note preview and truncation flag.",
     {
-      query: z.string().describe("Search term to find in element names, aliases, and notes"),
+      query: z.string().describe("Search term to find across all model text (names, notes, aliases, attributes, operations, constraints)"),
       objectType: z
         .string()
         .optional()
@@ -18,45 +67,136 @@ export function configureSearchTools(server: McpServer, db: Database): void {
     },
     async ({ query, objectType, stereotype, limit }) => {
       try {
-        const pattern = `%${query}%`;
-        let sql = `
-          SELECT o.Object_ID, o.Object_Type, o.Name, o.Alias, o.Stereotype,
-                 o.Package_ID, p.Name as PackageName, substr(o.Note, 1, 200) as NotePreview
-          FROM t_object o
-          LEFT JOIN t_package p ON o.Package_ID = p.Package_ID
-          WHERE (o.Name LIKE ? OR o.Alias LIKE ? OR o.Note LIKE ?)
-        `;
-        const params: SQLInputValue[] = [pattern, pattern, pattern];
+        const entries = buildCorpus(db);
+        const foldedQuery = foldText(query).trim();
 
+        if (foldedQuery.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({
+              results: [],
+              totalMatched: 0,
+              returned: 0,
+              truncated: false,
+              _meta: { sourceTables: ["t_object", "t_attribute", "t_operation", "t_objectconstraint", "t_package"] },
+              error: "Query is empty after normalization.",
+            }, null, 2) }],
+          };
+        }
+
+        // Find matching object IDs with match quality ranking
+        const matchMap = new Map<number, { rank: number; matchedIn: string }>();
+
+        for (const entry of entries) {
+          if (!entry.foldedText.includes(foldedQuery)) continue;
+
+          const existing = matchMap.get(entry.objectId);
+          let rank: number;
+          if (entry.sourceTable === "t_object" && entry.sourceField === "Name") {
+            rank = entry.foldedText === foldedQuery ? 0 : 1; // exact name vs substring
+          } else if (entry.sourceTable === "t_object" && entry.sourceField === "Alias") {
+            rank = 2;
+          } else if (entry.sourceTable === "t_object" && entry.sourceField === "Note") {
+            rank = 3;
+          } else {
+            rank = 4; // attribute, operation, constraint matches
+          }
+
+          if (!existing || rank < existing.rank) {
+            matchMap.set(entry.objectId, { rank, matchedIn: `${entry.sourceTable}.${entry.sourceField}` });
+          }
+        }
+
+        if (matchMap.size === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                results: [],
+                totalMatched: 0,
+                returned: 0,
+                truncated: false,
+                _meta: { sourceTables: ["t_object", "t_attribute", "t_operation", "t_objectconstraint", "t_package"] },
+              }, null, 2),
+            }],
+          };
+        }
+
+        // Sort by rank, then fetch element details from DB for top matches
+        const sortedIds = [...matchMap.entries()]
+          .sort((a, b) => a[1].rank - b[1].rank)
+          .map(([id]) => id);
+
+        // Build SQL to fetch matched elements with filters
+        let filterClauses = "";
+        const filterParams: SQLInputValue[] = [];
         if (objectType) {
-          sql += " AND o.Object_Type = ?";
-          params.push(objectType);
+          filterClauses += " AND o.Object_Type = ?";
+          filterParams.push(objectType);
         }
         if (stereotype) {
-          sql += " AND o.Stereotype = ?";
-          params.push(stereotype);
+          filterClauses += " AND o.Stereotype = ?";
+          filterParams.push(stereotype);
         }
 
-        sql += " ORDER BY CASE WHEN o.Name LIKE ? THEN 0 WHEN o.Alias LIKE ? THEN 1 ELSE 2 END, o.Name";
-        params.push(pattern, pattern);
-        sql += " LIMIT ?";
-        params.push(limit);
+        // Fetch all matching elements and apply filters
+        const placeholders = sortedIds.map(() => "?").join(",");
+        const sql = `
+          SELECT o.Object_ID, o.Object_Type, o.Name, o.Alias, o.Stereotype,
+                 o.Package_ID, p.Name as PackageName, o.Note
+          FROM t_object o
+          LEFT JOIN t_package p ON o.Package_ID = p.Package_ID
+          WHERE o.Object_ID IN (${placeholders})${filterClauses}
+        `;
+        const allRows = db.prepare(sql).all(...sortedIds, ...filterParams) as any[];
 
-        const rows = db.prepare(sql).all(...params);
+        // Re-sort by corpus rank and apply Slovak collation within same rank
+        const rowMap = new Map(allRows.map((r: any) => [r.Object_ID, r]));
+        const totalMatched = sortedIds.filter((id) => rowMap.has(id)).length;
+        const sorted = sortedIds
+          .filter((id) => rowMap.has(id))
+          .map((id) => rowMap.get(id)!);
 
-        if (rows.length === 0) {
+        const truncated = sorted.length > limit;
+        const results = sorted.slice(0, limit).map((r: any) => {
+          const decodedNote = decodeEntities(r.Note);
+          const notePreview = decodedNote ? decodedNote.slice(0, 200) : null;
+          const notePreviewTruncated = decodedNote != null && decodedNote.length > 200;
           return {
-            content: [{ type: "text", text: `No elements found matching "${query}"${objectType ? ` with type ${objectType}` : ""}${stereotype ? ` with stereotype ${stereotype}` : ""}` }],
+            Object_ID: r.Object_ID,
+            Object_Type: r.Object_Type,
+            Name: r.Name,
+            Alias: r.Alias,
+            Stereotype: r.Stereotype,
+            Package_ID: r.Package_ID,
+            PackageName: r.PackageName,
+            NotePreview: notePreview,
+            notePreviewTruncated,
+            matchedIn: matchMap.get(r.Object_ID)?.matchedIn ?? null,
+          };
+        });
+
+        const response: any = {
+          results,
+          totalMatched,
+          returned: results.length,
+          truncated,
+          _meta: { sourceTables: ["t_object", "t_attribute", "t_operation", "t_objectconstraint", "t_package"] },
+        };
+
+        if (truncated) {
+          response.continuation = {
+            tool: "ea_search",
+            arguments: { query, objectType, stereotype, limit: Math.max(limit * 2, totalMatched) },
           };
         }
 
         return {
-          content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
+          content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }],
         };
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         return {
-          content: [{ type: "text", text: `Error searching elements: ${msg}` }],
+          content: [{ type: "text" as const, text: `Error searching elements: ${msg}` }],
           isError: true,
         };
       }

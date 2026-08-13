@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { XMLParser } from "fast-xml-parser";
+import { decodeEntities } from "../text.js";
 const xmlParser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: "@_",
@@ -17,35 +18,79 @@ function parseScenarioXml(xml) {
             name: s["@_name"] || "",
             level: parseInt(s["@_level"] || "0", 10),
             guid: s["@_guid"] || "",
+            trigger: s["@_trigger"] || null,
+            uses: s["@_uses"] || null,
+            useslist: s["@_useslist"] || null,
+            result: s["@_result"] || null,
+            state: s["@_state"] || null,
+            link: s["@_link"] || null,
         }));
     }
     catch {
         return [];
     }
 }
+// R9: Scenario type ordering — Basic Path first, then Alternate, then Exception
+const SCENARIO_TYPE_ORDER = {
+    "Basic Path": 0,
+    "Alternate": 1,
+    "Exception": 2,
+};
 export function configureScenarioTools(server, db) {
-    server.tool("ea_get_scenarios", "Get use case scenario flows for an element. Returns parsed step-by-step flows from the element's scenarios (Basic Path, Alternate Paths, Exception Paths).", {
+    server.tool("ea_get_scenarios", "Get use case scenario flows for an element. Returns parsed step-by-step flows with all step attributes (trigger, uses, result, state, link) and scenario-level notes. Steps are numbered within each scenario. Scenarios ordered by type: Basic Path first, then Alternate, then Exception.", {
         elementId: z.coerce.number().describe("The Object_ID of the element (typically a UseCase) to get scenarios for"),
     }, async ({ elementId }) => {
         try {
+            // Verify element exists
+            const elExists = db.prepare("SELECT Object_ID FROM t_object WHERE Object_ID = ?").get(elementId);
+            if (!elExists) {
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ error: "not_found", message: `Element with ID ${elementId} not found`, elementId }, null, 2) }],
+                    isError: true,
+                };
+            }
             const rows = db.prepare(`
           SELECT Scenario, ScenarioType, XMLContent, Notes
           FROM t_objectscenarios
           WHERE Object_ID = ?
-          ORDER BY ea_guid
         `).all(elementId);
             if (rows.length === 0) {
                 return {
-                    content: [{ type: "text", text: `No scenarios found for element ${elementId}` }],
+                    content: [{ type: "text", text: JSON.stringify({
+                                scenarios: [],
+                                totalMatched: 0,
+                                returned: 0,
+                                truncated: false,
+                                _meta: { sourceTables: ["t_objectscenarios"] },
+                            }, null, 2) }],
                 };
             }
-            const scenarios = rows.map((row) => ({
-                name: row.Scenario,
-                type: row.ScenarioType,
-                steps: parseScenarioXml(row.XMLContent),
-            }));
+            // R9: Sort by scenario type order, then by name within each type
+            rows.sort((a, b) => {
+                const aOrder = SCENARIO_TYPE_ORDER[a.ScenarioType] ?? 99;
+                const bOrder = SCENARIO_TYPE_ORDER[b.ScenarioType] ?? 99;
+                if (aOrder !== bOrder)
+                    return aOrder - bOrder;
+                return (a.Scenario || "").localeCompare(b.Scenario || "", "sk");
+            });
+            const scenarios = rows.map((row) => {
+                const rawSteps = parseScenarioXml(row.XMLContent);
+                return {
+                    name: row.Scenario,
+                    type: row.ScenarioType,
+                    notes: decodeEntities(row.Notes),
+                    steps: rawSteps.map((s, i) => ({ stepNumber: i + 1, ...s })),
+                };
+            });
+            const response = {
+                scenarios,
+                totalMatched: scenarios.length,
+                returned: scenarios.length,
+                truncated: false,
+                _meta: { sourceTables: ["t_objectscenarios"] },
+            };
             return {
-                content: [{ type: "text", text: JSON.stringify(scenarios, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
             };
         }
         catch (error) {

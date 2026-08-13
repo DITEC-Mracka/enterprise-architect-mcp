@@ -2,6 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Database } from "../database.js";
 import type { SQLInputValue } from "node:sqlite";
 import { z } from "zod";
+import { buildPackagePath } from "../package-path.js";
+import { decodeEntities } from "../text.js";
 
 const MAX_INLINE_ITEMS = 50;
 
@@ -25,7 +27,7 @@ export function configureElementTools(server: McpServer, db: Database): void {
 
         if (!element) {
           return {
-            content: [{ type: "text", text: `Element with ID ${elementId} not found` }],
+            content: [{ type: "text", text: JSON.stringify({ error: "not_found", message: `Element with ID ${elementId} not found`, elementId }, null, 2) }],
             isError: true,
           };
         }
@@ -83,14 +85,54 @@ export function configureElementTools(server: McpServer, db: Database): void {
           };
         });
 
+        // R4: Diagrams this element appears on
+        const diagramRows = db.prepare(`
+          SELECT d.Diagram_ID, d.Name, d.Diagram_Type, d.Package_ID
+          FROM t_diagramobjects do_
+          JOIN t_diagram d ON do_.Diagram_ID = d.Diagram_ID
+          WHERE do_.Object_ID = ?
+        `).all(elementId) as any[];
+
+        const diagrams = diagramRows.map((d: any) => ({
+          diagramId: d.Diagram_ID,
+          name: d.Name,
+          type: d.Diagram_Type,
+          packagePath: buildPackagePath(db, d.Package_ID),
+        }));
+
+        // R10: Constraints (pre-conditions, post-conditions, invariants, process rules)
+        const constraintRows = db.prepare(`
+          SELECT "Constraint" as name, ConstraintType, Notes, Status
+          FROM t_objectconstraint
+          WHERE Object_ID = ?
+          ORDER BY ConstraintType, "Constraint"
+        `).all(elementId) as any[];
+
+        const constraints = constraintRows.map((c: any) => ({
+          name: c.name,
+          type: c.ConstraintType,
+          notes: decodeEntities(c.Notes),
+          status: c.Status || null,
+        }));
+
         const result = {
           ...element,
+          Note: decodeEntities(element.Note as string | null),
           attributes,
           attributesTruncated,
           attributesTotal: allAttributes.length,
           operations,
           operationsTruncated,
           operationsTotal: allOperations.length,
+          diagrams,
+          constraints,
+          _meta: {
+            sourceTables: ["t_object", "t_package", "t_attribute", "t_operation", "t_operationparams", "t_diagramobjects", "t_diagram", "t_objectconstraint"],
+            attributes: { totalMatched: allAttributes.length, returned: attributes.length, truncated: attributesTruncated },
+            operations: { totalMatched: allOperations.length, returned: operations.length, truncated: operationsTruncated },
+            diagrams: { totalMatched: diagramRows.length, returned: diagrams.length, truncated: false },
+            constraints: { totalMatched: constraintRows.length, returned: constraints.length, truncated: false },
+          },
         };
 
         return {
@@ -119,6 +161,15 @@ export function configureElementTools(server: McpServer, db: Database): void {
     },
     async ({ packageId, objectType, limit }) => {
       try {
+        // Verify package exists
+        const pkgExists = db.prepare("SELECT Package_ID FROM t_package WHERE Package_ID = ?").get(packageId);
+        if (!pkgExists) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ error: "not_found", message: `Package with ID ${packageId} not found`, packageId }, null, 2) }],
+            isError: true,
+          };
+        }
+
         let sql = `
           SELECT Object_ID, Object_Type, Name, Alias, Stereotype
           FROM t_object
@@ -134,9 +185,28 @@ export function configureElementTools(server: McpServer, db: Database): void {
         sql += " ORDER BY Object_Type, Name LIMIT ?";
         params.push(limit);
 
-        const rows = db.prepare(sql).all(...params);
+        const rows = db.prepare(sql).all(...params) as any[];
+
+        // Count total without limit for truncation reporting
+        let countSql = "SELECT COUNT(*) as cnt FROM t_object WHERE Package_ID = ?";
+        const countParams: SQLInputValue[] = [packageId];
+        if (objectType) {
+          countSql += " AND Object_Type = ?";
+          countParams.push(objectType);
+        }
+        const totalMatched = (db.prepare(countSql).get(...countParams) as any).cnt;
+        const truncated = rows.length < totalMatched;
+
+        const response = {
+          elements: rows,
+          totalMatched,
+          returned: rows.length,
+          truncated,
+          ...(truncated ? { continuation: { tool: "ea_list_elements", arguments: { packageId, objectType, limit: Math.max(limit * 2, totalMatched) } } } : {}),
+          _meta: { sourceTables: ["t_object"] },
+        };
         return {
-          content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
         };
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
